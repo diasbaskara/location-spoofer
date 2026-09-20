@@ -7,7 +7,7 @@
 iOS Location Spoofer Prepare = type=http-request,pattern=^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|gsp(?:e\d*-)?ssl\.ls\.apple\.com|gsp64-ssl\.ls\.apple\.com)\/(clls\/wloc|dispatcher\.arpc|directions\.arpc|wifi_request[^\s]*),requires-body=0,timeout=3,script-path=https://raw.githubusercontent.com/diasbaskara/location-spoofer/refs/heads/main/location-spoofer.js,argument=mode=prepare&debug=true
 
 # Response: rewrite coordinates
-iOS Location Spoofer = type=http-response,pattern=^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|gsp(?:e\d*-)?ssl\.ls\.apple\.com|gsp64-ssl\.ls\.apple\.com)\/(clls\/wloc|dispatcher\.arpc|directions\.arpc|wifi_request[^\s]*),requires-body=1,binary-body-mode=1,max-size=0,timeout=30,script-path=https://raw.githubusercontent.com/diasbaskara/location-spoofer/refs/heads/main/location-spoofer.js,argument=mode=response&latitude=37.3349&longitude=-122.00902&horizontalAccuracy=39&verticalAccuracy=1000&altitude=530&rawPassthrough=true&dumpRaw=true&rawLimit=2048&debug=true
+iOS Location Spoofer = type=http-response,pattern=^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|gsp(?:e\d*-)?ssl\.ls\.apple\.com|gsp64-ssl\.ls\.apple\.com)\/(clls\/wloc|dispatcher\.arpc|directions\.arpc|wifi_request[^\s]*),requires-body=1,binary-body-mode=1,max-size=0,timeout=30,script-path=https://raw.githubusercontent.com/diasbaskara/location-spoofer/refs/heads/main/location-spoofer.js,argument=mode=response&latitude=-7.7525&longitude=110.4915&horizontalAccuracy=39&verticalAccuracy=1000&altitude=530&rawPassthrough=true&debug=true
 
 [MITM]
 hostname = %APPEND% gs-loc.apple.com, gs-loc-cn.apple.com, gsp-ssl.ls.apple.com, gsp64-ssl.ls.apple.com, gspe85-ssl.ls.apple.com, bluedot.is.autonavi.com, bluedot.is.autonavi.com.gds.alibabadns.com
