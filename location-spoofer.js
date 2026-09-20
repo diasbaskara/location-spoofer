@@ -27,6 +27,11 @@
     // Default TRUE: when no known envelope parses, pass the original bytes
     // through untouched (safer for modern iOS endpoints like wifi_request_tile).
     rawPassthrough: true,
+    // iOS 26/27 wifi_request_tile: rewrite the response tilekey (f1) to the
+    // tile of the target coordinates, so the returned tile is internally
+    // consistent (tile region == AP coordinates). Default OFF until verified
+    // on-device that geod accepts a tilekey different from the one it asked.
+    tilekeyRewrite: false,
     debug: false,
     dumpRaw: false,
     dumpHeaders: false,
@@ -592,6 +597,108 @@
     return null;
   }
 
+  // ===== Apple wifi_request_tile tilekey (morton/OSM) =====
+  // tilekey -> morton unpack (Apple scheme) -> OSM tile at level 13 -> lat/lng.
+  // Port of acheong08/apple-corelocation-experiments lib/morton (+ buckhx/tiles
+  // math). Validated on real data: Cardiff (51.4816,-3.1791) encodes to
+  // 81644853, inside the reference AP cluster 81644851..81644861.
+  var TILE_LEVEL = 13;
+
+  function tileOsmXY(lat, lon, level) {
+    var n = 1 << level;
+    var x = n * ((lon + 180) / 360);
+    var latRad = (lat * Math.PI) / 180;
+    var y =
+      (n * (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI)) / 2;
+    return { x: Math.floor(x), y: Math.floor(y) };
+  }
+
+  function tilePack(row, col, level) {
+    var result = Math.pow(2, level << 1);
+    for (var i = 0; i < level; i += 1) {
+      if ((col & 1) !== 0) {
+        result += Math.pow(2, 2 * i);
+      }
+      if ((row & 1) !== 0) {
+        result += Math.pow(2, 2 * i + 1);
+      }
+      col = col >> 1;
+      row = row >> 1;
+    }
+    return result;
+  }
+
+  function tileUnpack(tileKey) {
+    var row = 0;
+    var col = 0;
+    var level = 0;
+    var quadKey = tileKey;
+    while (quadKey > 1) {
+      var mask = 1 << level;
+      if ((quadKey & 1) !== 0) {
+        col |= mask;
+      }
+      if ((quadKey & 2) !== 0) {
+        row |= mask;
+      }
+      level += 1;
+      quadKey = (quadKey - (quadKey & 3)) / 4;
+    }
+    return { row: row, col: col, level: level };
+  }
+
+  function tilekeyToLatLng(tileKey) {
+    try {
+      var u = tileUnpack(tileKey);
+      var n = Math.pow(2, u.level);
+      var lon = (u.col / n) * 360 - 180;
+      var latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * (u.row + 0.5)) / n)));
+      return {
+        lat: (latRad * 180) / Math.PI,
+        lon: lon,
+        level: u.level
+      };
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function tilekeyForLatLng(lat, lon) {
+    var t = tileOsmXY(lat, lon, TILE_LEVEL);
+    return tilePack(t.y, t.x, TILE_LEVEL);
+  }
+
+  // Read root-level f1 varint — the tilekey in a wifi_request_tile response.
+  function rootTilekeyValue(bytes) {
+    try {
+      var fields = parseFields(bytes);
+      for (var i = 0; i < fields.length; i += 1) {
+        if (fields[i].fieldNumber === 1 && fields[i].wireType === 0) {
+          return signedVarintFieldValue(fields[i]);
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+    return null;
+  }
+
+  // Rewrite root f1 (tilekey) to the tile containing the target coordinates,
+  // so the returned tile's region matches the (moved) AP coordinates.
+  function patchTilekey(bytes, config) {
+    var targetKey = tilekeyForLatLng(config.latitude, config.longitude);
+    var fields = parseFields(bytes);
+    var parts = [];
+    for (var i = 0; i < fields.length; i += 1) {
+      if (fields[i].fieldNumber === 1 && fields[i].wireType === 0) {
+        parts.push(makeVarintField(1, targetKey));
+      } else {
+        parts.push(fields[i].raw);
+      }
+    }
+    return { payload: concatBytes(parts), tileKey: targetKey };
+  }
+
   function coordToInt(value) {
     // 使用 Math.trunc 精确匹配 Go: int64(coord * 1e8)
     return Math.trunc(Number(value) * 100000000);
@@ -636,6 +743,7 @@
     if (cfg.rawPassthrough === undefined || cfg.rawPassthrough === null || cfg.rawPassthrough === "") {
       cfg.rawPassthrough = extractionUnparsedPassthroughDefault;
     }
+    cfg.tilekeyRewrite = parseBoolean(cfg.tilekeyRewrite, false);
     var mode = String(cfg.mode || "response").toLowerCase();
     cfg.mode = mode === "request" || mode === "prepare" || mode === "probe" || mode === "inspect" ? mode : "response";
     cfg.latitude = Number(cfg.latitude);
@@ -1090,13 +1198,24 @@
       try {
         var patchedTile = patchWifiRequestTile(responseBytes, config);
         if (patchedTile.wifiCount > 0) {
+          var tileKey = rootTilekeyValue(responseBytes);
+          var tilePayload = patchedTile.payload;
+          var outTileKey = tileKey;
+          if (config.tilekeyRewrite) {
+            var tilePatched = patchTilekey(tilePayload, config);
+            tilePayload = tilePatched.payload;
+            outTileKey = tilePatched.tileKey;
+          }
           return {
-            response: patchedTile.payload,
-            payload: patchedTile.payload,
+            response: tilePayload,
+            payload: tilePayload,
             wifiCount: patchedTile.wifiCount,
             cellCount: 0,
             kind: "tile",
-            prefix: ""
+            prefix: "",
+            tileKey: outTileKey,
+            origTileKey: tileKey,
+            tileRegion: tileKey != null ? tilekeyToLatLng(tileKey) : null
           };
         }
       } catch (err) {
@@ -2158,6 +2277,19 @@
     logRawDump("response-original", responseBody, config);
     var responseResult = spoofAppleResponse(responseBody, config);
     if (config.debug) {
+      var tileLog = "";
+      if (responseResult.kind === "tile") {
+        var region = responseResult.tileRegion;
+        tileLog =
+          ", tileKey=" +
+          (responseResult.tileKey == null ? "<none>" : responseResult.tileKey) +
+          (responseResult.origTileKey != null && responseResult.origTileKey !== responseResult.tileKey
+            ? " (was " + responseResult.origTileKey + ")"
+            : "") +
+          (region
+            ? ", tileRegion=" + region.lat.toFixed(5) + "," + region.lon.toFixed(5)
+            : "");
+      }
       console.log(
         "Location spoofer patched " +
           responseResult.wifiCount +
@@ -2169,7 +2301,8 @@
           (responseResult.prefix || "<none>") +
           ", response=" +
           responseResult.response.length +
-          " bytes"
+          " bytes" +
+          tileLog
       );
       console.log("Location spoofer patched locations: " + patchedPayloadSummary(responseResult.payload));
     }
@@ -2312,6 +2445,7 @@
     encodeVarintUnsigned: encodeVarintUnsigned,
     encodeVarintSignedInt64: encodeVarintSignedInt64,
     decodeVarint: decodeVarint,
+    signedVarintFieldValue: signedVarintFieldValue,
     makeVarintField: makeVarintField,
     makeLengthDelimitedField: makeLengthDelimitedField,
     parseFields: parseFields,
@@ -2325,6 +2459,12 @@
     patchWifiDevice: patchWifiDevice,
     patchCellTower: patchCellTower,
     patchAppleWLocPayload: patchAppleWLocPayload,
+    tilekeyForLatLng: tilekeyForLatLng,
+    tilekeyToLatLng: tilekeyToLatLng,
+    patchTilekey: patchTilekey,
+    looksLikeWifiRequestTile: looksLikeWifiRequestTile,
+    patchWifiRequestTile: patchWifiRequestTile,
+    patchE7CoordPair: patchE7CoordPair,
     parseArpc: parseArpc,
     serializeArpc: serializeArpc,
     buildAppleWLocResponse: buildAppleWLocResponse,

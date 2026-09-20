@@ -159,4 +159,71 @@ assert.strictEqual(t10.wifiCount, 0);
 assert.strictEqual(t10.cellCount, 0);
 // kind indicates unpatched passthrough, not a synthetic rewrap
 assert.ok(t10.kind.indexOf('unpatched') >= 0, 'kind should mark unpatched, got ' + t10.kind);
-console.log('ALL WLOC TESTS PASSED (T1-T10)');
+
+// ---- T11: Apple wifi_request_tile tilekey (morton/OSM) roundtrip ----
+// Ground truth: acheong08 research — Cardiff AP cluster between keys 81644851..81644861
+var cardiffKey = s.tilekeyForLatLng(51.4816, -3.1791);
+assert.ok(cardiffKey >= 81644851 && cardiffKey <= 81644861,
+  'Cardiff tilekey ' + cardiffKey + ' outside reference cluster 81644851..81644861');
+var ykTile = s.tilekeyForLatLng(-7.9124, 110.1971);   // Yogyakarta
+var cuTile = s.tilekeyForLatLng(37.3349, -122.00902); // Apple Park
+assert.notStrictEqual(ykTile, cuTile, 'Yogyakarta and Apple Park must be different tiles');
+var dec = s.tilekeyToLatLng(ykTile);
+assert.ok(Math.abs(dec.lat - -7.91) < 0.2 && Math.abs(dec.lon - 110.17) < 0.2,
+  'tile decode off, got ' + dec.lat + ',' + dec.lon);
+
+function fixed32LE(fieldNumber, value) {
+  // value: raw int32 already scaled by 1e7 (or lat/lng individual bytes helper below)
+  var b = [ (fieldNumber << 3) | 5 ];
+  for (var i = 0; i < 4; i++) b.push((value >>> (8 * i)) & 255);
+  return Uint8Array.from(b);
+}
+function e7(idx, deg) { return Math.trunc(Number(deg) * 10000000) | 0; }
+function buildWifiRequestTile(tilekey, aps) {
+  var list = [];
+  for (var i = 0; i < aps.length; i++) {
+    var ap = aps[i];
+    var coord = concat([fixed32LE(1, e7(1, ap[0])), fixed32LE(2, e7(2, ap[1]))]);
+    var apMsg = concat([s.makeVarintField(5, 1000 + i), s.makeLengthDelimitedField(6, coord), s.makeVarintField(7, 2000 + i)]);
+    list.push(s.makeLengthDelimitedField(2, apMsg));
+  }
+  var f3 = s.makeLengthDelimitedField(3, concat(list));
+  return concat([s.makeVarintField(1, tilekey), s.makeVarintField(8, 1), f3]);
+}
+var tileResp = buildWifiRequestTile(ykTile, [[-7.9124, 110.1971], [-7.9125, 110.1970], [-7.9126, 110.1972]]);
+
+// T11b: default (no rewrite) — f1 tilekey preserved as the origin tile
+var t11 = s.spoofAppleResponse(tileResp, Object.assign({}, TARGET, { latitude: 40.7128, longitude: -74.0060 }));
+assert.strictEqual(t11.kind, 'tile');
+assert.strictEqual(t11.wifiCount, 3);
+assert.strictEqual(t11.origTileKey, ykTile);
+assert.strictEqual(t11.tileKey, ykTile, 'tilekeyRewrite off must preserve f1');
+// moved AP coords must be NYC (E7 fixed32)
+function firstApCoord(payload) {
+  // root f3 -> list f2[0] -> f6 -> coord
+  var root = s.parseFields(payload);
+  var f3 = s.firstFieldByNumber(root, 3);
+  var list = s.parseFields(f3.valueBytes);
+  var ap = list[0]; // first f2
+  var apFields = s.parseFields(ap.valueBytes);
+  var f6 = s.firstFieldByNumber(apFields, 6);
+  var coord = s.parseFields(f6.valueBytes);
+  var lat = new DataView(coord[0].valueBytes.buffer, coord[0].valueBytes.byteOffset, 4).getInt32(0, true);
+  var lng = new DataView(coord[1].valueBytes.buffer, coord[1].valueBytes.byteOffset, 4).getInt32(0, true);
+  return [lat / 1e7, lng / 1e7];
+}
+var moved = firstApCoord(t11.payload);
+assert.ok(Math.abs(moved[0] - 40.7128) < 1e-6 && Math.abs(moved[1] + 74.006) < 1e-6,
+  'AP coords not moved to target, got ' + moved);
+
+// T11c: tilekeyRewrite=true rewrites f1 to the TARGET tile (NYC) while keeping structure
+var t11c = s.spoofAppleResponse(tileResp, Object.assign({}, TARGET, { latitude: 40.7128, longitude: -74.0060, tilekeyRewrite: true }));
+var nycTile = s.tilekeyForLatLng(40.7128, -74.0060);
+assert.strictEqual(t11c.tileKey, nycTile);
+assert.strictEqual(t11c.origTileKey, ykTile);
+var back1 = s.firstFieldByNumber(s.parseFields(t11c.payload), 1);
+assert.strictEqual(s.signedVarintFieldValue(back1), nycTile, 'f1 must equal target tilekey');
+// f8 (other root varint) still there, byte-equal to original
+assert.strictEqual(s.signedVarintFieldValue(s.firstFieldByNumber(s.parseFields(t11c.payload), 8)), 1);
+
+console.log('ALL WLOC TESTS PASSED (T1-T12)');

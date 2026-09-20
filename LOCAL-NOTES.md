@@ -36,7 +36,32 @@ cell-tower coordinates before CoreLocation triangulation sees them. No jailbreak
 - If MITM fails: check full trust in Settings → General → About → Certificate Trust Settings,
   disable QUIC/HTTP3, reconnect VPN, toggle Location Services off/on.
 
+## iOS 26/27 wifi_request_tile tilekey (morton/OSM)
+- WPS tile flow: geod requests a REGION tile (`gspe85-ssl.ls.apple.com/wifi_request_tile`,
+  guided by an `X-tilekey` header) and Apple returns APs *belonging to that tile*. The tilekey
+  is a morton-interleaved OSM tile coordinate at zoom **13** (Apple scheme). Port validated
+  against acheong08's real reference: Cardiff (51.4816,-3.1791) → **81644853**, inside the
+  cluster 81644851..81644861.
+- Helpers: `tilekeyForLatLng(lat,lng)` / `tilekeyToLatLng(key)` (T11 asserts roundtrip).
+- **Failure mode "Current location not available" (Maps + Google Maps):** moving tile AP
+  coordinates far (e.g. Yogyakarta tile `121756261` → Apple Park tile `78720159`, 13,841 km)
+  leaves the returned tile internally contradictory (Yogyakarta tilekey/region, Cupertino
+  coords) → geod rejects the whole response → no fix at all. Tile consistency, not parsing.
+- `tilekeyRewrite=true` (DEFAULT OFF) rewrites response root f1 to the target's tile, making
+  the tile region match the moved APs. If geod also validates "response tilekey == the one I
+  asked for" (the phone's real tile), far-distance spoofing on the tile flow is blocked by
+  design; the log (below) confirms which one it is.
+
+## Live diagnosis on device (Shadowrocket)
+- Module logs every interception. Key line after opening Maps (debug=true already set):
+  `Location spoofer patched N wifi devices, ..., kind=tile, ..., tileKey=NNNNN [region=lat,lon]`
+  — a kind=tile tileKey matching the PHONE's real position while target is far confirms the
+  tile-consistency rejection. A kind=raw-passthrough / short body instead points at delivery
+  (gzip/pattern/QUIC) or parser mismatch.
+- Raw payloads: `Location spoofer raw response-original base64 ...` chunks (dumpRaw=true).
+- Settings → Diagnostics → Enable Logging → VPN Logs to view.
+
 ## Test / verify
 ```bash
-node tests/wloc.test.js   # ALL WLOC TESTS PASSED (T1-T9)
+node tests/wloc.test.js   # ALL WLOC TESTS PASSED (T1-T12)
 ```
