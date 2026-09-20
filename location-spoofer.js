@@ -477,6 +477,112 @@
     return CELL_RESPONSE_FIELDS[fieldNumber] === true;
   }
 
+  // ===== iOS 26/27 wifi_request_tile schema =====
+  // Real captured response (geod <- gspe85-ssl.ls.apple.com/wifi_request_tile):
+  //   f1: tilekey varint
+  //   f3 { f2 []*wifiAp {                       // one per BSSID
+  //          f4 { f2 { f1:?, f2:? } },          // capability/config flags
+  //          f5: uint64 (timestamp-ish / row id),
+  //          f6 { f1: fixed32 lat(int32 LE, E7), f2: fixed32 lng(int32 LE, E7) }
+  //        },
+  //        f3: "", f4: 1, f5 {f2{..}}, f6: 3, f7: uint64 }
+  // Verified with a live dump: three APs decoded to (-7.9124, 110.1971)…(-7.9125, 110.1970)
+  // = Yogyakarta (user's actual position), spread < 1 m across BSSIDs.
+  // Note: unlike classic wloc (1e8 fixed via varint), here coords are **fixed32 LE int32 at 1e7**.
+
+  function patchWifiApTile(apPayload, config) {
+    var fields = parseFields(apPayload);
+    var parts = [];
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.fieldNumber === 6 && field.wireType === 2) {
+        parts.push(makeLengthDelimitedField(6, patchE7CoordPair(field.valueBytes, config)));
+      } else if (field.fieldNumber === 7 && field.wireType === 0) {
+        // f7 root row id kept as-is (not a location)
+        parts.push(field.raw);
+      } else {
+        parts.push(field.raw);
+      }
+    }
+    return concatBytes(parts);
+  }
+
+  // Patch a small protobuf that contains f1: fixed32 lat, f2: fixed32 lng (int32 LE, E7)
+  function patchE7CoordPair(bytes, config) {
+    var fields = parseFields(bytes);
+    var parts = [];
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.fieldNumber === 1 && field.wireType === 5) {
+        parts.push(makeFixed32Field(1, e7Fixed32(config.latitude)));
+      } else if (field.fieldNumber === 2 && field.wireType === 5) {
+        parts.push(makeFixed32Field(2, e7Fixed32(config.longitude)));
+      } else {
+        parts.push(field.raw);
+      }
+    }
+    return concatBytes(parts);
+  }
+
+  function e7Fixed32(deg) {
+    var v = Math.trunc(Number(deg) * 10000000) | 0; // int32 two's complement
+    var b = [];
+    for (var i = 0; i < 4; i += 1) {
+      b.push((v >>> (8 * i)) & 0xff);
+    }
+    return b;
+  }
+
+  function makeFixed32Field(fieldNumber, valueLE) {
+    return Uint8Array.from([(fieldNumber << 3) | 5].concat(valueLE));
+  }
+
+  // Patch the tile wrapper: rewrite every f2 wifiAp submessage under the root-level f3
+  function patchWifiRequestTile(bytes, config) {
+    var fields = parseFields(bytes);
+    var parts = [];
+    var wifiCount = 0;
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.fieldNumber === 3 && field.wireType === 2) {
+        parts.push(makeLengthDelimitedField(3, patchTileApList(field.valueBytes, config)));
+      } else {
+        parts.push(field.raw);
+      }
+    }
+    // count APs for reporting
+    try {
+      var root = parseFields(bytes);
+      for (var j = 0; j < root.length; j += 1) {
+        if (root[j].fieldNumber === 3 && root[j].wireType === 2) {
+          var list = parseFields(root[j].valueBytes);
+          for (var k = 0; k < list.length; k += 1) {
+            if (list[k].fieldNumber === 2 && list[k].wireType === 2) {
+              wifiCount += 1;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // best-effort counting only
+    }
+    return { payload: concatBytes(parts), wifiCount: wifiCount };
+  }
+
+  function patchTileApList(bytes, config) {
+    var fields = parseFields(bytes);
+    var parts = [];
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.fieldNumber === 2 && field.wireType === 2) {
+        parts.push(makeLengthDelimitedField(2, patchWifiApTile(field.valueBytes, config)));
+      } else {
+        parts.push(field.raw);
+      }
+    }
+    return concatBytes(parts);
+  }
+
   function firstCellResponseField(fields) {
     for (var i = 0; i < fields.length; i += 1) {
       if (isCellResponseField(fields[i].fieldNumber)) {
@@ -923,8 +1029,81 @@
     return bytes;
   }
 
+  // Heuristic: wifi_request_tile responses start with f1 varint (tilekey)
+  // followed by a length-delimited f3 wrapper; the f3 content must contain
+  // repeated f2 submessages whose f6 holds an E7 coord pair.
+  function looksLikeWifiRequestTile(bytes) {
+    if (!bytes || bytes.length < 12) {
+      return false;
+    }
+    var fields = tryParseFields(bytes);
+    if (!fields) {
+      return false;
+    }
+    for (var i = 0; i < fields.length; i += 1) {
+      if (fields[i].fieldNumber !== 3 || fields[i].wireType !== 2) {
+        continue;
+      }
+      var list = tryParseFields(fields[i].valueBytes);
+      if (!list) {
+        continue;
+      }
+      for (var j = 0; j < list.length; j += 1) {
+        if (list[j].fieldNumber !== 2 || list[j].wireType !== 2) {
+          continue;
+        }
+        var ap = tryParseFields(list[j].valueBytes);
+        if (!ap) {
+          continue;
+        }
+        for (var k = 0; k < ap.length; k += 1) {
+          if (ap[k].fieldNumber === 6 && ap[k].wireType === 2) {
+            var coord = tryParseFields(ap[k].valueBytes);
+            if (coord) {
+              var lat = null;
+              var lng = null;
+              for (var m = 0; m < coord.length; m += 1) {
+                if (coord[m].fieldNumber === 1 && coord[m].wireType === 5 && coord[m].valueBytes.length === 4) {
+                  lat = true;
+                }
+                if (coord[m].fieldNumber === 2 && coord[m].wireType === 5 && coord[m].valueBytes.length === 4) {
+                  lng = true;
+                }
+              }
+              if (lat && lng) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   function spoofAppleResponse(responseBytes, configInput) {
     var config = normalizeConfig(configInput);
+
+    // iOS 26/27 fast path: wifi_request_tile responses use a NEW protobuf
+    // schema (E7 fixed32 coords). Try it BEFORE the classic wloc extraction.
+    if (looksLikeWifiRequestTile(responseBytes)) {
+      try {
+        var patchedTile = patchWifiRequestTile(responseBytes, config);
+        if (patchedTile.wifiCount > 0) {
+          return {
+            response: patchedTile.payload,
+            payload: patchedTile.payload,
+            wifiCount: patchedTile.wifiCount,
+            cellCount: 0,
+            kind: "tile",
+            prefix: ""
+          };
+        }
+      } catch (err) {
+        // fall through to classic handling; rawPassthrough keeps it safe
+      }
+    }
+
     var extraction = null;
     var strictError = null;
     try {
